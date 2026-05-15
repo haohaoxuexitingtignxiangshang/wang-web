@@ -949,20 +949,24 @@
     </div>
 
     <script>
-        // ===== Supabase 初始化 =====
+        // ===== 存储模式检测 =====
+        // Vercel 部署时会自动替换 {{NEXT_PUBLIC_SUPABASE_URL}} 为真实值
+        // 本地运行时占位符未被替换 → 自动降级为 localStorage
         var SUPABASE_URL = '{{NEXT_PUBLIC_SUPABASE_URL}}';
         var SUPABASE_ANON_KEY = '{{NEXT_PUBLIC_SUPABASE_ANON_KEY}}';
+        var useSupabase = SUPABASE_URL.indexOf('{{') === -1 && SUPABASE_URL.length > 0;
 
-        var supabase;
-        var supabaseReady = false;
-
-        try {
-            supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-                realtime: { params: { eventsPerSecond: 10 } }
-            });
-            supabaseReady = true;
-        } catch (e) {
-            console.error('Supabase 初始化失败', e);
+        var supabase = null;
+        if (useSupabase && window.supabase) {
+            try {
+                supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+                    realtime: { params: { eventsPerSecond: 10 } }
+                });
+            } catch (e) {
+                console.error('Supabase 初始化失败，降级到本地存储', e);
+                supabase = null;
+                useSupabase = false;
+            }
         }
 
         // ===== 内存缓存 =====
@@ -976,11 +980,26 @@
             { id: "3", name: "王芳", gender: "女", totalScore: 278, recentPerformance: "课堂发言积极，作业需要更细心", extraTags: ["文艺委员"] }
         ];
 
-        // ===== 实时同步 =====
-        function setupRealtime() {
-            if (!supabaseReady) return;
+        // ===== 本地存储辅助函数 =====
+        function saveLocalStudents() {
+            localStorage.setItem('students', JSON.stringify(studentsCache));
+        }
 
-            // 监听 students 表变更
+        function saveLocalExams() {
+            localStorage.setItem('historyExams', JSON.stringify(examsCache));
+        }
+
+        function sortExamsByDate(a, b) {
+            if (a.examDate === b.examDate) return 0;
+            if (a.examDate === '未知日期') return 1;
+            if (b.examDate === '未知日期') return -1;
+            return a.examDate > b.examDate ? -1 : 1;
+        }
+
+        // ===== 实时同步（仅 Supabase 模式） =====
+        function setupRealtime() {
+            if (!useSupabase || !supabase) return;
+
             supabase
                 .channel('students-changes')
                 .on('postgres_changes',
@@ -998,11 +1017,9 @@
                         } else if (payload.eventType === 'DELETE') {
                             studentsCache = studentsCache.filter(function (s) { return s.id !== payload.old.id; });
                         }
-                        // 刷新当前页面 UI
                         if (currentPage === 'page-students') {
                             renderStudentList();
                         }
-                        // 如果详情模态框打开着且修改的是当前学生，刷新模态框
                         if (currentStudentId && (payload.eventType === 'UPDATE') && payload.new.id === currentStudentId) {
                             refreshModalForStudent(payload.new);
                         }
@@ -1014,7 +1031,6 @@
                     }
                 });
 
-            // 监听 history_exams 表变更
             supabase
                 .channel('exams-changes')
                 .on('postgres_changes',
@@ -1042,14 +1058,6 @@
                 .subscribe();
         }
 
-        function sortExamsByDate(a, b) {
-            if (a.examDate === b.examDate) return 0;
-            if (a.examDate === '未知日期') return 1;
-            if (b.examDate === '未知日期') return -1;
-            return a.examDate > b.examDate ? -1 : 1;
-        }
-
-        // 当实时同步更新当前打开的学生时，刷新模态框中的非编辑字段
         function refreshModalForStudent(student) {
             document.getElementById('modal-title').textContent = student.name;
             document.getElementById('modal-score').textContent = student.totalScore + ' 分';
@@ -1061,53 +1069,69 @@
 
         // ===== 数据加载与初始化 =====
         async function loadStudents() {
-            if (!supabaseReady) return;
-            var result = await supabase.from('students').select('*').order('createdAt', { ascending: true });
-            if (result.error) {
-                console.error('加载学生失败', result.error);
-                document.getElementById('sync-dot').classList.add('offline');
-                return;
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').select('*').order('createdAt', { ascending: true });
+                if (result.error) {
+                    console.error('加载学生失败', result.error);
+                    document.getElementById('sync-dot').classList.add('offline');
+                    return;
+                }
+                studentsCache = result.data || [];
+            } else {
+                // localStorage 模式
+                var raw = localStorage.getItem('students');
+                if (raw) {
+                    studentsCache = JSON.parse(raw);
+                } else {
+                    studentsCache = JSON.parse(JSON.stringify(DEFAULT_STUDENTS));
+                    saveLocalStudents();
+                }
             }
-            studentsCache = result.data || [];
         }
 
         async function loadExams() {
-            if (!supabaseReady) return;
-            var result = await supabase.from('history_exams').select('*').order('importedAt', { ascending: false });
-            if (result.error) {
-                console.error('加载考试失败', result.error);
-                document.getElementById('sync-dot').classList.add('offline');
-                return;
+            if (useSupabase && supabase) {
+                var result = await supabase.from('history_exams').select('*').order('importedAt', { ascending: false });
+                if (result.error) {
+                    console.error('加载考试失败', result.error);
+                    document.getElementById('sync-dot').classList.add('offline');
+                    return;
+                }
+                examsCache = result.data || [];
+                examsCache.sort(sortExamsByDate);
+            } else {
+                var raw = localStorage.getItem('historyExams');
+                examsCache = raw ? JSON.parse(raw) : [];
+                examsCache.sort(sortExamsByDate);
             }
-            examsCache = result.data || [];
-            examsCache.sort(sortExamsByDate);
         }
 
         async function seedDefaultStudents() {
-            if (!supabaseReady) return;
-            var result = await supabase.from('students').select('id', { count: 'exact', head: true });
-            if (result.error || result.count > 0) return;
-
-            var insertResult = await supabase.from('students').upsert(DEFAULT_STUDENTS, { onConflict: 'id' });
-            if (insertResult.error) {
-                console.error('初始化学生数据失败', insertResult.error);
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').select('id', { count: 'exact', head: true });
+                if (result.error || result.count > 0) return;
+                await supabase.from('students').upsert(DEFAULT_STUDENTS, { onConflict: 'id' });
             }
+            // localStorage 模式下 loadStudents 已处理首次初始化
         }
 
         async function initApp() {
-            if (!supabaseReady) {
-                // Supabase 不可用时的降级提示
-                document.getElementById('sync-dot').classList.add('offline');
-                document.getElementById('sync-dot').title = '云端未连接 — 请检查环境变量配置';
-                showToast('云端未连接，请刷新重试', 3000);
-                return;
+            var dot = document.getElementById('sync-dot');
+
+            if (useSupabase && supabase) {
+                dot.title = '云端同步模式';
+            } else {
+                dot.classList.add('offline');
+                dot.title = '本地存储模式 — 部署到 Vercel 并集成 Supabase 后可启用云端同步';
             }
 
             await seedDefaultStudents();
             await Promise.all([loadStudents(), loadExams()]);
-            setupRealtime();
 
-            // 初始化完成后渲染当前页面
+            if (useSupabase && supabase) {
+                setupRealtime();
+            }
+
             if (currentPage === 'page-exam') renderExamList();
             if (currentPage === 'page-students') renderStudentList();
         }
@@ -1218,18 +1242,27 @@
 
                     scores.sort(function (a, b) { return b.totalScore - a.totalScore; });
 
-                    if (!supabaseReady) { showToast('云端未连接'); return; }
-
-                    var insertResult = await supabase.from('history_exams').insert({
-                        examName: examName,
-                        examDate: examDate,
-                        scores: scores,
-                        importedAt: new Date().toISOString()
-                    });
-
-                    if (insertResult.error) {
-                        showToast('保存失败：' + insertResult.error.message);
-                        return;
+                    if (useSupabase && supabase) {
+                        var insertResult = await supabase.from('history_exams').insert({
+                            examName: examName,
+                            examDate: examDate,
+                            scores: scores,
+                            importedAt: new Date().toISOString()
+                        });
+                        if (insertResult.error) {
+                            showToast('保存失败：' + insertResult.error.message);
+                            return;
+                        }
+                    } else {
+                        examsCache.push({
+                            id: Date.now(),
+                            examName: examName,
+                            examDate: examDate,
+                            scores: scores,
+                            importedAt: new Date().toISOString()
+                        });
+                        examsCache.sort(sortExamsByDate);
+                        saveLocalExams();
                     }
 
                     showToast('成功导入「' + examName + '」，共 ' + scores.length + ' 名学生');
@@ -1344,12 +1377,15 @@
 
             if (!confirm('确定要删除学生「' + student.name + '」吗？此操作不可撤销。')) return;
 
-            if (!supabaseReady) { showToast('云端未连接'); return; }
-
-            var result = await supabase.from('students').delete().eq('id', studentId);
-            if (result.error) {
-                showToast('删除失败：' + result.error.message);
-                return;
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').delete().eq('id', studentId);
+                if (result.error) {
+                    showToast('删除失败：' + result.error.message);
+                    return;
+                }
+            } else {
+                studentsCache = studentsCache.filter(function (s) { return s.id !== studentId; });
+                saveLocalStudents();
             }
 
             showToast('已删除「' + student.name + '」');
@@ -1391,20 +1427,24 @@
             var totalScore = parseInt(document.getElementById('form-score').value) || 0;
             var performance = document.getElementById('form-performance').value.trim() || '新录入的学生';
 
-            if (!supabaseReady) { showToast('云端未连接'); return; }
-
-            var result = await supabase.from('students').insert({
+            var newStudent = {
                 id: String(Date.now()),
                 name: name,
                 gender: gender,
                 totalScore: totalScore,
                 recentPerformance: performance,
                 extraTags: []
-            });
+            };
 
-            if (result.error) {
-                showToast('添加失败：' + result.error.message);
-                return;
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').insert(newStudent);
+                if (result.error) {
+                    showToast('添加失败：' + result.error.message);
+                    return;
+                }
+            } else {
+                studentsCache.push(newStudent);
+                saveLocalStudents();
             }
 
             closeFormModalDirect();
@@ -1446,8 +1486,6 @@
                         showToast('未找到"学生姓名"列，请检查 Excel 表头');
                         return;
                     }
-
-                    if (!supabaseReady) { showToast('云端未连接'); return; }
 
                     var importCount = 0;
                     var updateCount = 0;
@@ -1498,10 +1536,29 @@
                         return;
                     }
 
-                    var result = await supabase.from('students').upsert(upsertRows, { onConflict: 'id' });
-                    if (result.error) {
-                        showToast('导入失败：' + result.error.message);
-                        return;
+                    if (useSupabase && supabase) {
+                        var result = await supabase.from('students').upsert(upsertRows, { onConflict: 'id' });
+                        if (result.error) {
+                            showToast('导入失败：' + result.error.message);
+                            return;
+                        }
+                    } else {
+                        // 合并到缓存
+                        for (var k = 0; k < upsertRows.length; k++) {
+                            var row = upsertRows[k];
+                            var found = false;
+                            for (var m = 0; m < studentsCache.length; m++) {
+                                if (studentsCache[m].id === row.id) {
+                                    studentsCache[m] = row;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                studentsCache.push(row);
+                            }
+                        }
+                        saveLocalStudents();
                     }
 
                     var msg = '成功导入 ' + importCount + ' 名学生';
@@ -1560,19 +1617,30 @@
 
         async function savePerformance() {
             if (!currentStudentId) return;
-            if (!supabaseReady) { showToast('云端未连接'); return; }
 
             var newText = document.getElementById('modal-textarea').value.trim();
             var newGender = document.getElementById('modal-gender').value;
 
-            var result = await supabase.from('students').update({
-                recentPerformance: newText,
-                gender: newGender
-            }).eq('id', currentStudentId);
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').update({
+                    recentPerformance: newText,
+                    gender: newGender
+                }).eq('id', currentStudentId);
 
-            if (result.error) {
-                showToast('保存失败：' + result.error.message);
-                return;
+                if (result.error) {
+                    showToast('保存失败：' + result.error.message);
+                    return;
+                }
+            } else {
+                for (var i = 0; i < studentsCache.length; i++) {
+                    if (studentsCache[i].id === currentStudentId) {
+                        studentsCache[i].recentPerformance = newText;
+                        studentsCache[i].gender = newGender;
+                        break;
+                    }
+                }
+                saveLocalStudents();
+                renderStudentList();
             }
 
             document.getElementById('modal-textarea').value = newText;
@@ -1602,7 +1670,6 @@
 
         async function deleteTag(index) {
             if (!currentStudentId) return;
-            if (!supabaseReady) { showToast('云端未连接'); return; }
 
             var student = null;
             for (var i = 0; i < studentsCache.length; i++) {
@@ -1613,16 +1680,21 @@
             var tags = (student.extraTags || []).slice();
             tags.splice(index, 1);
 
-            var result = await supabase.from('students').update({ extraTags: tags }).eq('id', currentStudentId);
-            if (result.error) {
-                showToast('删除失败：' + result.error.message);
-                return;
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').update({ extraTags: tags }).eq('id', currentStudentId);
+                if (result.error) {
+                    showToast('删除失败：' + result.error.message);
+                    return;
+                }
+            } else {
+                student.extraTags = tags;
+                saveLocalStudents();
+                renderTags(student);
             }
         }
 
         async function addTag() {
             if (!currentStudentId) return;
-            if (!supabaseReady) { showToast('云端未连接'); return; }
 
             var input = document.getElementById('tag-input');
             var newTag = input.value.trim();
@@ -1637,13 +1709,19 @@
             var tags = (student.extraTags || []).slice();
             tags.push(newTag);
 
-            var result = await supabase.from('students').update({ extraTags: tags }).eq('id', currentStudentId);
-            if (result.error) {
-                showToast('添加失败：' + result.error.message);
-                return;
+            if (useSupabase && supabase) {
+                var result = await supabase.from('students').update({ extraTags: tags }).eq('id', currentStudentId);
+                if (result.error) {
+                    showToast('添加失败：' + result.error.message);
+                    return;
+                }
+                input.value = '';
+            } else {
+                student.extraTags = tags;
+                saveLocalStudents();
+                renderTags(student);
+                input.value = '';
             }
-
-            input.value = '';
         }
 
         function escapeHtml(str) {

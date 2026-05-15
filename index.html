@@ -4,7 +4,43 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>王老师的班级管理器</title>
+
+    <!--
+    ===== Supabase 建表 SQL（在 Supabase SQL Editor 中执行） =====
+
+    CREATE TABLE students (
+      "id" TEXT PRIMARY KEY,
+      "name" TEXT NOT NULL,
+      "gender" TEXT DEFAULT '待完善',
+      "totalScore" INTEGER DEFAULT 0,
+      "recentPerformance" TEXT DEFAULT '',
+      "extraTags" JSONB DEFAULT '[]'::jsonb,
+      "createdAt" TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE history_exams (
+      "id" BIGSERIAL PRIMARY KEY,
+      "examName" TEXT NOT NULL,
+      "examDate" TEXT NOT NULL,
+      "scores" JSONB DEFAULT '[]'::jsonb,
+      "importedAt" TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    -- 启用 RLS
+    ALTER TABLE students ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE history_exams ENABLE ROW LEVEL SECURITY;
+
+    -- 允许匿名访问（公开演示用；生产环境应加认证）
+    CREATE POLICY "anon_all" ON students FOR ALL USING (true) WITH CHECK (true);
+    CREATE POLICY "anon_all" ON history_exams FOR ALL USING (true) WITH CHECK (true);
+
+    -- 启用实时同步
+    ALTER PUBLICATION supabase_realtime ADD TABLE students;
+    ALTER PUBLICATION supabase_realtime ADD TABLE history_exams;
+    -->
+
     <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
     <style>
         *, *::before, *::after {
             box-sizing: border-box;
@@ -732,6 +768,25 @@
             margin: 0;
         }
 
+        /* 同步状态指示器 */
+        .sync-indicator {
+            position: fixed;
+            bottom: 16px;
+            right: 16px;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #4caf50;
+            box-shadow: 0 0 6px rgba(76,175,80,0.4);
+            z-index: 500;
+            transition: background 0.3s;
+        }
+
+        .sync-indicator.offline {
+            background: #f44336;
+            box-shadow: 0 0 6px rgba(244,67,54,0.4);
+        }
+
         /* Toast */
         .toast {
             position: fixed;
@@ -758,6 +813,9 @@
 
     <!-- Toast -->
     <div id="toast" class="toast"></div>
+
+    <!-- 同步状态指示器 -->
+    <div id="sync-dot" class="sync-indicator" title="云端已连接"></div>
 
     <!-- ==================== 页面区 ==================== -->
 
@@ -838,7 +896,7 @@
             <div class="modal-section-title">其他情况</div>
             <div id="modal-tags"></div>
             <div class="tag-add-row">
-                <input class="tag-input" id="tag-input" placeholder="输入新词条，如"发言进步"">
+                <input class="tag-input" id="tag-input" placeholder="输入新词条，如&ldquo;发言进步&rdquo;">
                 <button class="btn-add-tag" onclick="addTag()">添加词条</button>
             </div>
             <div class="modal-section-title">最近表现</div>
@@ -891,7 +949,172 @@
     </div>
 
     <script>
+        // ===== Supabase 初始化 =====
+        var SUPABASE_URL = '{{NEXT_PUBLIC_SUPABASE_URL}}';
+        var SUPABASE_ANON_KEY = '{{NEXT_PUBLIC_SUPABASE_ANON_KEY}}';
+
+        var supabase;
+        var supabaseReady = false;
+
+        try {
+            supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+                realtime: { params: { eventsPerSecond: 10 } }
+            });
+            supabaseReady = true;
+        } catch (e) {
+            console.error('Supabase 初始化失败', e);
+        }
+
+        // ===== 内存缓存 =====
+        var studentsCache = [];
+        var examsCache = [];
+
+        // ===== 默认学生数据（首次初始化用） =====
+        var DEFAULT_STUDENTS = [
+            { id: "1", name: "张三", gender: "男", totalScore: 285, recentPerformance: "最近上课专注，作业完成良好", extraTags: ["热爱阅读", "数学课代表"] },
+            { id: "2", name: "李四", gender: "女", totalScore: 292, recentPerformance: "英语突出，需加强语文", extraTags: ["英语课代表"] },
+            { id: "3", name: "王芳", gender: "女", totalScore: 278, recentPerformance: "课堂发言积极，作业需要更细心", extraTags: ["文艺委员"] }
+        ];
+
+        // ===== 实时同步 =====
+        function setupRealtime() {
+            if (!supabaseReady) return;
+
+            // 监听 students 表变更
+            supabase
+                .channel('students-changes')
+                .on('postgres_changes',
+                    { event: '*', schema: 'public', table: 'students' },
+                    function (payload) {
+                        if (payload.eventType === 'INSERT') {
+                            studentsCache.push(payload.new);
+                        } else if (payload.eventType === 'UPDATE') {
+                            for (var i = 0; i < studentsCache.length; i++) {
+                                if (studentsCache[i].id === payload.new.id) {
+                                    studentsCache[i] = payload.new;
+                                    break;
+                                }
+                            }
+                        } else if (payload.eventType === 'DELETE') {
+                            studentsCache = studentsCache.filter(function (s) { return s.id !== payload.old.id; });
+                        }
+                        // 刷新当前页面 UI
+                        if (currentPage === 'page-students') {
+                            renderStudentList();
+                        }
+                        // 如果详情模态框打开着且修改的是当前学生，刷新模态框
+                        if (currentStudentId && (payload.eventType === 'UPDATE') && payload.new.id === currentStudentId) {
+                            refreshModalForStudent(payload.new);
+                        }
+                    }
+                )
+                .subscribe(function (status) {
+                    if (status === 'SUBSCRIBED') {
+                        document.getElementById('sync-dot').classList.remove('offline');
+                    }
+                });
+
+            // 监听 history_exams 表变更
+            supabase
+                .channel('exams-changes')
+                .on('postgres_changes',
+                    { event: '*', schema: 'public', table: 'history_exams' },
+                    function (payload) {
+                        if (payload.eventType === 'INSERT') {
+                            examsCache.push(payload.new);
+                            examsCache.sort(sortExamsByDate);
+                        } else if (payload.eventType === 'UPDATE') {
+                            for (var i = 0; i < examsCache.length; i++) {
+                                if (examsCache[i].id === payload.new.id) {
+                                    examsCache[i] = payload.new;
+                                    break;
+                                }
+                            }
+                            examsCache.sort(sortExamsByDate);
+                        } else if (payload.eventType === 'DELETE') {
+                            examsCache = examsCache.filter(function (e) { return e.id !== payload.old.id; });
+                        }
+                        if (currentPage === 'page-exam') {
+                            renderExamList();
+                        }
+                    }
+                )
+                .subscribe();
+        }
+
+        function sortExamsByDate(a, b) {
+            if (a.examDate === b.examDate) return 0;
+            if (a.examDate === '未知日期') return 1;
+            if (b.examDate === '未知日期') return -1;
+            return a.examDate > b.examDate ? -1 : 1;
+        }
+
+        // 当实时同步更新当前打开的学生时，刷新模态框中的非编辑字段
+        function refreshModalForStudent(student) {
+            document.getElementById('modal-title').textContent = student.name;
+            document.getElementById('modal-score').textContent = student.totalScore + ' 分';
+            var genderSelect = document.getElementById('modal-gender');
+            genderSelect.value = (student.gender === '女') ? '女' : '男';
+            document.getElementById('modal-textarea').value = student.recentPerformance || '';
+            renderTags(student);
+        }
+
+        // ===== 数据加载与初始化 =====
+        async function loadStudents() {
+            if (!supabaseReady) return;
+            var result = await supabase.from('students').select('*').order('createdAt', { ascending: true });
+            if (result.error) {
+                console.error('加载学生失败', result.error);
+                document.getElementById('sync-dot').classList.add('offline');
+                return;
+            }
+            studentsCache = result.data || [];
+        }
+
+        async function loadExams() {
+            if (!supabaseReady) return;
+            var result = await supabase.from('history_exams').select('*').order('importedAt', { ascending: false });
+            if (result.error) {
+                console.error('加载考试失败', result.error);
+                document.getElementById('sync-dot').classList.add('offline');
+                return;
+            }
+            examsCache = result.data || [];
+            examsCache.sort(sortExamsByDate);
+        }
+
+        async function seedDefaultStudents() {
+            if (!supabaseReady) return;
+            var result = await supabase.from('students').select('id', { count: 'exact', head: true });
+            if (result.error || result.count > 0) return;
+
+            var insertResult = await supabase.from('students').upsert(DEFAULT_STUDENTS, { onConflict: 'id' });
+            if (insertResult.error) {
+                console.error('初始化学生数据失败', insertResult.error);
+            }
+        }
+
+        async function initApp() {
+            if (!supabaseReady) {
+                // Supabase 不可用时的降级提示
+                document.getElementById('sync-dot').classList.add('offline');
+                document.getElementById('sync-dot').title = '云端未连接 — 请检查环境变量配置';
+                showToast('云端未连接，请刷新重试', 3000);
+                return;
+            }
+
+            await seedDefaultStudents();
+            await Promise.all([loadStudents(), loadExams()]);
+            setupRealtime();
+
+            // 初始化完成后渲染当前页面
+            if (currentPage === 'page-exam') renderExamList();
+            if (currentPage === 'page-students') renderStudentList();
+        }
+
         // ===== 页面导航 =====
+        var currentPage = localStorage.getItem('currentPage') || 'page-welcome';
+
         function goTo(pageId) {
             showPage(pageId);
             localStorage.setItem('currentPage', pageId);
@@ -903,6 +1126,7 @@
                 pages[i].classList.remove('active');
             }
             document.getElementById(pageId).classList.add('active');
+            currentPage = pageId;
 
             if (pageId === 'page-exam') {
                 renderExamList();
@@ -913,7 +1137,6 @@
         }
 
         // 初始化
-        var currentPage = localStorage.getItem('currentPage') || 'page-welcome';
         showPage(currentPage);
         if (!localStorage.getItem('currentPage')) {
             showPage('page-welcome');
@@ -936,7 +1159,7 @@
             if (!file) return;
 
             var reader = new FileReader();
-            reader.onload = function (evt) {
+            reader.onload = async function (evt) {
                 try {
                     var data = new Uint8Array(evt.target.result);
                     var workbook = XLSX.read(data, { type: 'array' });
@@ -995,23 +1218,20 @@
 
                     scores.sort(function (a, b) { return b.totalScore - a.totalScore; });
 
-                    var historyExams = JSON.parse(localStorage.getItem('historyExams') || '[]');
-                    historyExams.push({
+                    if (!supabaseReady) { showToast('云端未连接'); return; }
+
+                    var insertResult = await supabase.from('history_exams').insert({
                         examName: examName,
                         examDate: examDate,
                         scores: scores,
                         importedAt: new Date().toISOString()
                     });
 
-                    historyExams.sort(function (a, b) {
-                        if (a.examDate === b.examDate) return 0;
-                        if (a.examDate === '未知日期') return 1;
-                        if (b.examDate === '未知日期') return -1;
-                        return a.examDate > b.examDate ? -1 : 1;
-                    });
+                    if (insertResult.error) {
+                        showToast('保存失败：' + insertResult.error.message);
+                        return;
+                    }
 
-                    localStorage.setItem('historyExams', JSON.stringify(historyExams));
-                    renderExamList();
                     showToast('成功导入「' + examName + '」，共 ' + scores.length + ' 名学生');
                 } catch (err) {
                     showToast('解析文件出错：' + err.message);
@@ -1022,14 +1242,13 @@
             e.target.value = '';
         }
 
-        // ===== 渲染考试列表 =====
+        // ===== 渲染考试列表（从缓存） =====
         function renderExamList() {
-            var historyExams = JSON.parse(localStorage.getItem('historyExams') || '[]');
             var listEl = document.getElementById('exam-list');
             var emptyEl = document.getElementById('exam-empty');
             var titleEl = document.getElementById('list-title');
 
-            if (historyExams.length === 0) {
+            if (examsCache.length === 0) {
                 listEl.innerHTML = '';
                 emptyEl.style.display = 'block';
                 titleEl.style.display = 'none';
@@ -1040,12 +1259,12 @@
             titleEl.style.display = 'block';
 
             var html = '';
-            for (var i = 0; i < historyExams.length; i++) {
-                var exam = historyExams[i];
+            for (var i = 0; i < examsCache.length; i++) {
+                var exam = examsCache[i];
                 html += '<div class="exam-item" onclick="toggleDetail(' + i + ', this)">';
                 html += '  <div class="exam-item-name">' + escapeHtml(exam.examName) + '</div>';
                 html += '  <div class="exam-item-date">' + escapeHtml(exam.examDate) + '</div>';
-                html += '  <div class="exam-item-count">' + exam.scores.length + ' 名学生</div>';
+                html += '  <div class="exam-item-count">' + (exam.scores || []).length + ' 名学生</div>';
                 html += '  <div class="exam-detail" id="detail-' + i + '"></div>';
                 html += '</div>';
             }
@@ -1070,11 +1289,11 @@
             }
 
             if (!detailEl.innerHTML) {
-                var historyExams = JSON.parse(localStorage.getItem('historyExams') || '[]');
-                var exam = historyExams[index];
+                var exam = examsCache[index];
+                var examScores = exam.scores || [];
                 var tableHtml = '<table><thead><tr><th class="rank-col">#</th><th>姓名</th><th class="score-col">总分</th></tr></thead><tbody>';
-                for (var i = 0; i < exam.scores.length; i++) {
-                    var s = exam.scores[i];
+                for (var i = 0; i < examScores.length; i++) {
+                    var s = examScores[i];
                     tableHtml += '<tr>';
                     tableHtml += '<td class="rank-col">' + (i + 1) + '</td>';
                     tableHtml += '<td>' + escapeHtml(s.name) + '</td>';
@@ -1089,42 +1308,23 @@
             openDetailIndex = index;
         }
 
-        // ===== 学生数据 =====
-        var DEFAULT_STUDENTS = [
-            { id: "1", name: "张三", gender: "男", totalScore: 285, recentPerformance: "最近上课专注，作业完成良好", extraTags: ["热爱阅读", "数学课代表"] },
-            { id: "2", name: "李四", gender: "女", totalScore: 292, recentPerformance: "英语突出，需加强语文", extraTags: ["英语课代表"] },
-            { id: "3", name: "王芳", gender: "女", totalScore: 278, recentPerformance: "课堂发言积极，作业需要更细心", extraTags: ["文艺委员"] }
-        ];
-
-        function getStudents() {
-            if (!localStorage.getItem('students')) {
-                localStorage.setItem('students', JSON.stringify(DEFAULT_STUDENTS));
-            }
-            return JSON.parse(localStorage.getItem('students'));
-        }
-
-        function saveStudents(students) {
-            localStorage.setItem('students', JSON.stringify(students));
-        }
-
-        // ===== 渲染学生列表 =====
+        // ===== 学生列表渲染（从缓存） =====
         function renderStudentList() {
-            var students = getStudents();
             var listEl = document.getElementById('student-list');
 
-            if (students.length === 0) {
+            if (studentsCache.length === 0) {
                 listEl.innerHTML = '<div class="empty-state">暂无学生数据</div>';
                 return;
             }
 
             var html = '';
-            for (var i = 0; i < students.length; i++) {
-                var s = students[i];
+            for (var i = 0; i < studentsCache.length; i++) {
+                var s = studentsCache[i];
                 html += '<div class="student-row">';
                 html += '  <button class="student-btn" onclick="openStudentModal(\'' + s.id + '\')">';
                 html +=      escapeHtml(s.name);
                 html +=      '<span class="student-gender">' + escapeHtml(s.gender) + '</span>';
-                html +=      '<span class="student-score">' + s.totalScore + '分</span>';
+                html +=      '<span class="student-score">' + (s.totalScore || 0) + '分</span>';
                 html += '  </button>';
                 html += '  <button class="student-delete" onclick="deleteStudent(\'' + s.id + '\', event)" title="删除">🗑️</button>';
                 html += '</div>';
@@ -1133,24 +1333,25 @@
         }
 
         // ===== 删除学生 =====
-        function deleteStudent(studentId, e) {
+        async function deleteStudent(studentId, e) {
             if (e) { e.stopPropagation(); }
 
-            var students = getStudents();
             var student = null;
-            for (var i = 0; i < students.length; i++) {
-                if (students[i].id === studentId) {
-                    student = students[i];
-                    break;
-                }
+            for (var i = 0; i < studentsCache.length; i++) {
+                if (studentsCache[i].id === studentId) { student = studentsCache[i]; break; }
             }
             if (!student) return;
 
             if (!confirm('确定要删除学生「' + student.name + '」吗？此操作不可撤销。')) return;
 
-            students = students.filter(function (s) { return s.id !== studentId; });
-            saveStudents(students);
-            renderStudentList();
+            if (!supabaseReady) { showToast('云端未连接'); return; }
+
+            var result = await supabase.from('students').delete().eq('id', studentId);
+            if (result.error) {
+                showToast('删除失败：' + result.error.message);
+                return;
+            }
+
             showToast('已删除「' + student.name + '」');
         }
 
@@ -1177,7 +1378,7 @@
             document.body.style.overflow = '';
         }
 
-        function submitAddStudent() {
+        async function submitAddStudent() {
             var name = document.getElementById('form-name').value.trim();
             if (!name) {
                 showToast('请输入学生姓名');
@@ -1190,20 +1391,23 @@
             var totalScore = parseInt(document.getElementById('form-score').value) || 0;
             var performance = document.getElementById('form-performance').value.trim() || '新录入的学生';
 
-            var newStudent = {
+            if (!supabaseReady) { showToast('云端未连接'); return; }
+
+            var result = await supabase.from('students').insert({
                 id: String(Date.now()),
                 name: name,
                 gender: gender,
                 totalScore: totalScore,
                 recentPerformance: performance,
                 extraTags: []
-            };
+            });
 
-            var students = getStudents();
-            students.push(newStudent);
-            saveStudents(students);
+            if (result.error) {
+                showToast('添加失败：' + result.error.message);
+                return;
+            }
+
             closeFormModalDirect();
-            renderStudentList();
             showToast('已添加学生「' + name + '」');
         }
 
@@ -1213,7 +1417,7 @@
             if (!file) return;
 
             var reader = new FileReader();
-            reader.onload = function (evt) {
+            reader.onload = async function (evt) {
                 try {
                     var data = new Uint8Array(evt.target.result);
                     var workbook = XLSX.read(data, { type: 'array' });
@@ -1243,9 +1447,18 @@
                         return;
                     }
 
-                    var students = getStudents();
+                    if (!supabaseReady) { showToast('云端未连接'); return; }
+
                     var importCount = 0;
                     var updateCount = 0;
+
+                    // 构建姓名→现有学生映射
+                    var nameToStudent = {};
+                    for (var j = 0; j < studentsCache.length; j++) {
+                        nameToStudent[studentsCache[j].name] = studentsCache[j];
+                    }
+
+                    var upsertRows = [];
 
                     for (var r = 1; r < rows.length; r++) {
                         var row = rows[r];
@@ -1254,47 +1467,42 @@
                         var name = String(row[idxName] || '').trim();
                         if (!name) continue;
 
-                        // 尝试获取总分，缺失则用语文+数学+英语计算
                         var totalScore = (idxTotal !== -1) ? (parseFloat(row[idxTotal]) || 0) : 0;
                         if (totalScore === 0 && idxChinese !== -1 && idxMath !== -1 && idxEnglish !== -1) {
-                            var chinese = parseFloat(row[idxChinese]) || 0;
-                            var math = parseFloat(row[idxMath]) || 0;
-                            var english = parseFloat(row[idxEnglish]) || 0;
-                            totalScore = chinese + math + english;
+                            totalScore = (parseFloat(row[idxChinese]) || 0) + (parseFloat(row[idxMath]) || 0) + (parseFloat(row[idxEnglish]) || 0);
                         }
 
-                        // 按姓名查找是否已存在
-                        var existingIdx = -1;
-                        for (var j = 0; j < students.length; j++) {
-                            if (students[j].name === name) {
-                                existingIdx = j;
-                                break;
-                            }
-                        }
-
-                        if (existingIdx !== -1) {
-                            students[existingIdx].totalScore = totalScore;
+                        var existing = nameToStudent[name];
+                        if (existing) {
+                            existing.totalScore = totalScore;
+                            upsertRows.push(existing);
                             updateCount++;
                         } else {
-                            students.push({
-                                id: String(Date.now()) + '_' + r,
+                            var newId = String(Date.now()) + '_' + r;
+                            var newStudent = {
+                                id: newId,
                                 name: name,
                                 gender: '待完善',
                                 totalScore: totalScore,
                                 recentPerformance: '新导入的学生',
                                 extraTags: []
-                            });
+                            };
+                            upsertRows.push(newStudent);
+                            nameToStudent[name] = newStudent;
                             importCount++;
                         }
                     }
 
-                    if (importCount === 0 && updateCount === 0) {
+                    if (upsertRows.length === 0) {
                         showToast('未从文件中读取到有效学生数据');
                         return;
                     }
 
-                    saveStudents(students);
-                    renderStudentList();
+                    var result = await supabase.from('students').upsert(upsertRows, { onConflict: 'id' });
+                    if (result.error) {
+                        showToast('导入失败：' + result.error.message);
+                        return;
+                    }
 
                     var msg = '成功导入 ' + importCount + ' 名学生';
                     if (updateCount > 0) {
@@ -1314,20 +1522,16 @@
         var currentStudentId = null;
 
         function openStudentModal(studentId) {
-            var students = getStudents();
             var student = null;
-            for (var i = 0; i < students.length; i++) {
-                if (students[i].id === studentId) {
-                    student = students[i];
-                    break;
-                }
+            for (var i = 0; i < studentsCache.length; i++) {
+                if (studentsCache[i].id === studentId) { student = studentsCache[i]; break; }
             }
             if (!student) return;
 
             currentStudentId = studentId;
 
             document.getElementById('modal-title').textContent = student.name;
-            document.getElementById('modal-score').textContent = student.totalScore + ' 分';
+            document.getElementById('modal-score').textContent = (student.totalScore || 0) + ' 分';
 
             var genderSelect = document.getElementById('modal-gender');
             if (student.gender === '女') {
@@ -1336,7 +1540,7 @@
                 genderSelect.value = '男';
             }
 
-            document.getElementById('modal-textarea').value = student.recentPerformance;
+            document.getElementById('modal-textarea').value = student.recentPerformance || '';
             document.getElementById('tag-input').value = '';
             renderTags(student);
             document.getElementById('modal-overlay').classList.add('open');
@@ -1354,23 +1558,24 @@
             currentStudentId = null;
         }
 
-        function savePerformance() {
+        async function savePerformance() {
             if (!currentStudentId) return;
+            if (!supabaseReady) { showToast('云端未连接'); return; }
 
             var newText = document.getElementById('modal-textarea').value.trim();
             var newGender = document.getElementById('modal-gender').value;
-            var students = getStudents();
-            for (var i = 0; i < students.length; i++) {
-                if (students[i].id === currentStudentId) {
-                    students[i].recentPerformance = newText;
-                    students[i].gender = newGender;
-                    break;
-                }
+
+            var result = await supabase.from('students').update({
+                recentPerformance: newText,
+                gender: newGender
+            }).eq('id', currentStudentId);
+
+            if (result.error) {
+                showToast('保存失败：' + result.error.message);
+                return;
             }
-            saveStudents(students);
 
             document.getElementById('modal-textarea').value = newText;
-            renderStudentList();
             showToast('保存成功');
         }
 
@@ -1395,38 +1600,50 @@
             container.innerHTML = html;
         }
 
-        function deleteTag(index) {
+        async function deleteTag(index) {
             if (!currentStudentId) return;
+            if (!supabaseReady) { showToast('云端未连接'); return; }
 
-            var students = getStudents();
-            for (var i = 0; i < students.length; i++) {
-                if (students[i].id === currentStudentId) {
-                    students[i].extraTags.splice(index, 1);
-                    saveStudents(students);
-                    renderTags(students[i]);
-                    return;
-                }
+            var student = null;
+            for (var i = 0; i < studentsCache.length; i++) {
+                if (studentsCache[i].id === currentStudentId) { student = studentsCache[i]; break; }
+            }
+            if (!student) return;
+
+            var tags = (student.extraTags || []).slice();
+            tags.splice(index, 1);
+
+            var result = await supabase.from('students').update({ extraTags: tags }).eq('id', currentStudentId);
+            if (result.error) {
+                showToast('删除失败：' + result.error.message);
+                return;
             }
         }
 
-        function addTag() {
+        async function addTag() {
             if (!currentStudentId) return;
+            if (!supabaseReady) { showToast('云端未连接'); return; }
 
             var input = document.getElementById('tag-input');
             var newTag = input.value.trim();
             if (!newTag) return;
 
-            var students = getStudents();
-            for (var i = 0; i < students.length; i++) {
-                if (students[i].id === currentStudentId) {
-                    if (!students[i].extraTags) students[i].extraTags = [];
-                    students[i].extraTags.push(newTag);
-                    saveStudents(students);
-                    input.value = '';
-                    renderTags(students[i]);
-                    return;
-                }
+            var student = null;
+            for (var i = 0; i < studentsCache.length; i++) {
+                if (studentsCache[i].id === currentStudentId) { student = studentsCache[i]; break; }
             }
+            if (!student) return;
+
+            var tags = (student.extraTags || []).slice();
+            tags.push(newTag);
+
+            var result = await supabase.from('students').update({ extraTags: tags }).eq('id', currentStudentId);
+            if (result.error) {
+                showToast('添加失败：' + result.error.message);
+                return;
+            }
+
+            input.value = '';
         }
 
         function escapeHtml(str) {
@@ -1434,6 +1651,9 @@
             div.appendChild(document.createTextNode(str));
             return div.innerHTML;
         }
+
+        // ===== 启动应用 =====
+        initApp();
     </script>
 
 </body>
